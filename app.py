@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import random
+import re
 
 app = FastAPI()
 
@@ -10,6 +11,10 @@ class ListingRequest(BaseModel):
     tracking_code: str
     price: str
     product_info_lines: list[str] = Field(..., min_items=5, max_items=5)
+
+
+class RawListingRequest(BaseModel):
+    listing_text: str
 
 
 # Phrase pools
@@ -59,13 +64,7 @@ DASH_LINE = "----------------------------------------"
 
 
 def shuffled_cycle(items: list[str]):
-    """
-    Infinite generator:
-    - shuffles the list
-    - yields each item once
-    - reshuffles and repeats
-    This spreads variation evenly while staying random.
-    """
+    """Shuffle the list and yield each item once, then reshuffle and repeat forever."""
     pool = items[:]
     while True:
         random.shuffle(pool)
@@ -73,11 +72,9 @@ def shuffled_cycle(items: list[str]):
             yield item
 
 
-@app.post("/generate")
-def generate_listings(data: ListingRequest):
+def generate_95(data: ListingRequest) -> dict:
     listings: list[str] = []
 
-    # Create “balanced random” generators (random order, low clumping)
     title_gen = shuffled_cycle(title_variations)
     benefit_gen = shuffled_cycle(benefit_lines)
     condition_gen = shuffled_cycle(condition_lines)
@@ -85,7 +82,7 @@ def generate_listings(data: ListingRequest):
 
     for _ in range(95):
         info = data.product_info_lines[:]   # copy
-        random.shuffle(info)                # randomize bullet order each listing
+        random.shuffle(info)                # shuffle bullet order each listing
 
         title_prefix = next(title_gen)
         benefit = next(benefit_gen)
@@ -117,6 +114,78 @@ Product Information:
         listings.append(listing)
 
     return {
-        "filename": f"{data.main_keyword}-{data.tracking_code}-95.txt",
+        "filename": f"{data.main_keyword.replace(' ', '-')}-{data.tracking_code}-95.txt",
         "content": "\n".join(listings)
     }
+
+
+def parse_listing_text(listing_text: str) -> ListingRequest:
+    # Normalize line endings and strip extra whitespace
+    text = listing_text.replace("\r\n", "\n").strip()
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip() != ""]
+    if len(lines) < 2:
+        raise HTTPException(status_code=400, detail="Listing text is too short.")
+
+    # Title is first non-empty line
+    title_line = lines[0]
+
+    # Price: first line that looks like $105, $105.00, etc.
+    price = None
+    for ln in lines:
+        if re.match(r"^\$\d+(\.\d{2})?$", ln):
+            price = ln
+            break
+    if not price:
+        raise HTTPException(status_code=400, detail="Could not find a price line like $105.")
+
+    # Tracking code: last token in title line
+    title_tokens = title_line.split()
+    if len(title_tokens) < 2:
+        raise HTTPException(status_code=400, detail="Title line not valid.")
+    tracking_code = title_tokens[-1]
+
+    # Remove tracking code from title line
+    title_without_code = " ".join(title_tokens[:-1]).strip()
+
+    # Remove common "new" prefixes if present (so generator can add its own random prefix)
+    # e.g. "Brand New", "New", "Just Released", etc.
+    removable_prefixes = [
+        "Brand New", "New", "Just Released", "Latest Model", "New Modern", "New Contemporary",
+        "New Space-Saving", "New Compact", "New Bedroom Essential", "New Minimalist",
+        "New Functional", "New Stylish", "New Home Upgrade", "New Storage Solution",
+        "New Apartment Ready", "New Sleek Design"
+    ]
+    main_keyword = title_without_code
+    for pref in sorted(removable_prefixes, key=len, reverse=True):
+        if main_keyword.lower().startswith(pref.lower() + " "):
+            main_keyword = main_keyword[len(pref):].strip()
+            break
+
+    # Product info bullets: grab lines starting with ●
+    bullets = [ln.lstrip("●").strip() for ln in lines if ln.startswith("●")]
+    if len(bullets) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Found {len(bullets)} bullet lines starting with ●. Need 5."
+        )
+
+    product_info_lines = bullets[:5]
+
+    return ListingRequest(
+        main_keyword=main_keyword,
+        tracking_code=tracking_code,
+        price=price,
+        product_info_lines=product_info_lines
+    )
+
+
+@app.post("/generate")
+def generate_listings(data: ListingRequest):
+    return generate_95(data)
+
+
+@app.post("/generate_from_listing")
+def generate_from_listing(data: RawListingRequest):
+    parsed = parse_listing_text(data.listing_text)
+    return generate_95(parsed)
